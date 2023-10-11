@@ -14,6 +14,6 @@ export default class AnnouncementConcept {
   }
 
   async create(user: ObjectId, body: string) {
-    return await { msg: "Announcement successfully created!", announcement: this.announcements.createOne({ user: user, body: body }) };
+    return { msg: "Announcement successfully created!", announcement: await this.announcements.createOne({ user: user, body: body }) };
   }
 }

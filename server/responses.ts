@@ -16,7 +16,9 @@ export default class Responses {
       return post;
     }
     const author = await User.getUserById(post.author);
-    return { ...post, author: author.username };
+    const tagged = await User.idsToUsernames(post.tagged);
+
+    return { ...post, author: author.username, tagged: tagged };
   }
 
   /**

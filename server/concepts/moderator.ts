@@ -1,21 +1,43 @@
 import { ObjectId } from "mongodb";
+import Sentiment from "sentiment";
 import DocCollection, { BaseDoc } from "../framework/doc";
+import { NotAllowedError, NotFoundError } from "./errors";
 
 export interface ModeratorDoc extends BaseDoc {
   user: ObjectId;
-  analyzedText: string;
-  flaggedWordCount: number;
+  content: string;
+  score: number;
 }
 
 export default class ModeratorConcept {
-  private readonly flags = ["hate", "stupid", "idiot"]; // short list for right now
-  private readonly threshold = 2;
   public readonly moderators = new DocCollection<ModeratorDoc>("moderators");
+  private readonly sentiment = new Sentiment();
 
-  // Question for OH: how do I implement the sync?
-  /*const count = this.flags
-      .map((x) => (body.match(`/${x}/g`) || []).length)
-      .reduce((a, b) => {
-        return a + b;
-    }, 0);*/
+  async create(user: ObjectId, content: string) {
+    const analysis = this.sentiment.analyze(content);
+    return { msg: "Moderator created successfully!", moderator: await this.moderators.createOne({ user: user, content: content, score: analysis.comparative }) };
+  }
+
+  async isSentimentNegative(_id: ObjectId) {
+    const moderator = await this.moderators.readOne({ _id });
+    if (moderator === null) {
+      throw new NotFoundError(`Moderator not found!`);
+    }
+
+    if (moderator.score < 0) {
+      const date = new Date();
+      date.setDate(date.getDate() - 7);
+      const count = (await this.moderators.readMany({ $and: [{ score: { $lt: 0 } }, { dateCreated: { $gte: date } }] })).length;
+      throw new NegativeSentimentError(moderator.score, count);
+    }
+  }
+}
+
+export class NegativeSentimentError extends NotAllowedError {
+  constructor(
+    public readonly sentiment: number,
+    public readonly count: number,
+  ) {
+    super("Your text had a negative sentiment score of {0}. You have had {1} negative reactions this week. Maybe it's time to log off.", sentiment, count);
+  }
 }

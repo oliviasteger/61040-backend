@@ -2,9 +2,12 @@ import { ObjectId } from "mongodb";
 
 import { Router, getExpressRouter } from "./framework/router";
 
-import { Announcement, Comment, Friend, Post, User, WebSession } from "./app";
-import { CommentDoc } from "./concepts/comment";
-import { PostDoc, PostOptions } from "./concepts/post";
+import { Announcement, Friend, Moderator, Post, Profile, ReactionOnPost, ReactionOnThread, Recap, ScheduledMessage, Thread, User, WebSession } from "./app";
+import { PostDoc } from "./concepts/post";
+import { ProfileDoc } from "./concepts/profile";
+import { ReactionDoc } from "./concepts/reaction";
+import { Content, ScheduledMessageDoc } from "./concepts/scheduledmessage";
+import { ThreadDoc } from "./concepts/thread";
 import { UserDoc } from "./concepts/user";
 import { WebSessionDoc } from "./concepts/websession";
 import Responses from "./responses";
@@ -27,10 +30,13 @@ class Routes {
   }
 
   @Router.post("/users")
-  async createUser(session: WebSessionDoc, username: string, password: string) {
+  async createUser(session: WebSessionDoc, username: string, password: string, phone: string) {
     WebSession.isLoggedOut(session);
-    return await User.create(username, password);
-    // Should also create a profile for the user with blank name and bio
+    const user = await User.create(username, password, phone);
+    if (user.user) {
+      await Profile.create(user.user?._id);
+    }
+    return user;
   }
 
   @Router.patch("/users")
@@ -60,31 +66,77 @@ class Routes {
   }
 
   @Router.get("/posts")
-  async getPosts(author?: string) {
+  async getPosts(session: WebSessionDoc, author?: string) {
+    const user = WebSession.getUser(session);
+    const friends = await Friend.getFriends(user);
+
     let posts;
+
     if (author) {
       const id = (await User.getUserByUsername(author))._id;
+      if (id.toString() !== user.toString()) await Friend.verifyFriends(user, id);
       posts = await Post.getByAuthor(id);
     } else {
-      posts = await Post.getPosts({});
+      posts = await Post.getPosts({ author: { $in: friends } });
     }
+
     return Responses.posts(posts);
   }
 
   @Router.post("/posts")
-  async createPost(session: WebSessionDoc, content: string, options?: PostOptions) {
+  async createPost(session: WebSessionDoc, content: string, image: string, tagged: string[]) {
     const user = WebSession.getUser(session);
-    const created = await Post.create(user, content, options);
+    await Post.isValidContent(content, image);
+
+    // Run moderator before allowing post
+    if (content) {
+      const moderatorId = (await Moderator.create(user, content)).moderator;
+      await Moderator.isSentimentNegative(moderatorId);
+    }
+    // Check if tagged users are friends, and update to ObjectId
+    const taggedIds: ObjectId[] = [];
+
+    for (const username of tagged) {
+      const usernameId = (await User.getUserByUsername(username))._id;
+      if (usernameId.toString() !== user.toString()) await Friend.verifyFriends(user, usernameId);
+      taggedIds.push((await User.getUserByUsername(username))._id);
+    }
+
+    const created = await Post.create(user, taggedIds, content, image);
     return { msg: created.msg, post: await Responses.post(created.post) };
-    // run moderator before posting
   }
 
   @Router.patch("/posts/:_id")
-  async updatePost(session: WebSessionDoc, _id: ObjectId, update: Partial<PostDoc>) {
+  async updatePost(session: WebSessionDoc, _id: ObjectId, update: Partial<Omit<PostDoc, "tagged"> & { tagged: string[] }>) {
     const user = WebSession.getUser(session);
+    if (update.content || update.image) await Post.isValidContent(update.content, update.image);
     await Post.isAuthor(user, _id);
-    return await Post.update(_id, update);
-    // run moderator before posting
+
+    const updateModified: Partial<PostDoc> = {};
+
+    // Run moderator before allowing update
+    if (update.content) {
+      const moderatorId = (await Moderator.create(user, update.content)).moderator;
+      await Moderator.isSentimentNegative(moderatorId);
+
+      updateModified.content = update.content;
+    }
+
+    // Check if tagged users are friends, and update to ObjectId
+    const taggedIds: ObjectId[] = [];
+    if (update.tagged) {
+      for (const username of update.tagged) {
+        const usernameId = (await User.getUserByUsername(username))._id;
+        if (usernameId.toString() !== user.toString()) await Friend.verifyFriends(user, usernameId);
+        taggedIds.push((await User.getUserByUsername(username))._id);
+      }
+
+      updateModified.tagged = taggedIds;
+    }
+
+    if (update.image) updateModified.image = update.image;
+
+    return await Post.update(_id, updateModified);
   }
 
   @Router.delete("/posts/:_id")
@@ -92,6 +144,139 @@ class Routes {
     const user = WebSession.getUser(session);
     await Post.isAuthor(user, _id);
     return Post.delete(_id);
+  }
+
+  @Router.get("/threads")
+  async getThreads(session: WebSessionDoc) {
+    const user = WebSession.getUser(session);
+    return await Thread.getThreads({ user });
+  }
+
+  @Router.get("/posts/:_root/threads")
+  async getThreadsOfPost(session: WebSessionDoc, _root: ObjectId) {
+    const user = WebSession.getUser(session);
+    await verifyPosterFriendship(user, _root);
+    return Thread.getThreads({ $and: [{ target: _root }, { root: _root }] });
+  }
+
+  @Router.get("/threads/:_target/threads")
+  async getThreadsOfThread(session: WebSessionDoc, _target: ObjectId) {
+    const user = WebSession.getUser(session);
+    await verifyPosterFriendship(user, await getRootId(_target));
+    return Thread.getThreads({ target: _target });
+  }
+
+  @Router.post("/posts/:_root/threads")
+  async createThread(session: WebSessionDoc, _root: ObjectId, content: string, target?: ObjectId) {
+    const user = WebSession.getUser(session);
+    await verifyPosterFriendship(user, _root);
+
+    // Check that target root is the same as the root
+    if (target) await Thread.isRootMatch(target, _root);
+
+    // Run Moderator before allowing thread
+    const moderatorId = (await Moderator.create(user, content)).moderator;
+    await Moderator.isSentimentNegative(moderatorId);
+
+    return await Thread.create(user, target ? target : _root, _root, content);
+  }
+
+  @Router.patch("/threads/:_id")
+  async updateThread(session: WebSessionDoc, _id: ObjectId, update: Partial<ThreadDoc>) {
+    const user = WebSession.getUser(session);
+    await Thread.isAuthor(user, _id);
+    await verifyPosterFriendship(user, await getRootId(_id));
+
+    // Run Moderator before allowing update
+    if (update.content) {
+      const moderatorId = (await Moderator.create(user, update.content)).moderator;
+      await Moderator.isSentimentNegative(moderatorId);
+    }
+
+    return await Thread.update(_id, update);
+  }
+
+  @Router.delete("/threads/:_id")
+  async deleteThread(session: WebSessionDoc, _id: ObjectId) {
+    const user = WebSession.getUser(session);
+    await Thread.isAuthor(user, _id);
+    return await Thread.delete(_id);
+  }
+
+  @Router.get("/reactions")
+  async getReactions(session: WebSessionDoc) {
+    const user = WebSession.getUser(session);
+    const reactionsOnPosts = await ReactionOnPost.getReactions({ user });
+    const reactionsOnThreads = await ReactionOnThread.getReactions({ user });
+    return reactionsOnPosts.concat(reactionsOnThreads);
+  }
+
+  @Router.get("/posts/:_target/reactions")
+  async getReactionsByPost(session: WebSessionDoc, _target: ObjectId) {
+    const user = WebSession.getUser(session);
+    await verifyPosterFriendship(user, _target);
+    return await ReactionOnPost.getReactions({ target: _target });
+  }
+
+  @Router.get("/threads/:_target/reactions")
+  async getReactionsByThread(session: WebSessionDoc, _target: ObjectId) {
+    const user = WebSession.getUser(session);
+
+    const thread = (await Thread.getThreads({ _id: _target }))[0];
+    await verifyPosterFriendship(user, thread.root);
+
+    return await ReactionOnThread.getReactions({ target: _target });
+  }
+
+  @Router.post("/posts/:_target/reactions")
+  async createReactionOnPost(session: WebSessionDoc, _target: ObjectId, content: string) {
+    const user = WebSession.getUser(session);
+    await verifyPosterFriendship(user, _target);
+    return await ReactionOnPost.create(user, _target, content);
+  }
+
+  @Router.post("/threads/:_target/reactions")
+  async createReactionOnThread(session: WebSessionDoc, _target: ObjectId, content: string) {
+    const user = WebSession.getUser(session);
+
+    const thread = (await Thread.getThreads({ _id: _target }))[0];
+    await verifyPosterFriendship(user, thread.root);
+
+    return await ReactionOnThread.create(user, _target, content);
+  }
+
+  @Router.patch("/posts/:_target/reactions/:_id")
+  async updateReactionOnPost(session: WebSessionDoc, _target: ObjectId, _id: ObjectId, update: Partial<ReactionDoc>) {
+    const user = WebSession.getUser(session);
+    await verifyPosterFriendship(user, _target);
+    await ReactionOnPost.isAuthor(user, _id);
+    return await ReactionOnPost.update(_id, update);
+  }
+
+  @Router.patch("/threads/:_target/reactions/:_id")
+  async updateReactionOnThread(session: WebSessionDoc, _target: ObjectId, _id: ObjectId, update: Partial<ReactionDoc>) {
+    const user = WebSession.getUser(session);
+    const thread = (await Thread.getThreads({ _id: _target }))[0];
+    await verifyPosterFriendship(user, thread.root);
+    await ReactionOnThread.isAuthor(user, _id);
+    return await ReactionOnThread.update(_id, update);
+  }
+
+  @Router.delete("/posts/:_target/reactions:_id")
+  async deleteReactionOnPost(session: WebSessionDoc, _target: ObjectId, _id: ObjectId) {
+    const user = WebSession.getUser(session);
+    await verifyPosterFriendship(user, _target);
+    await ReactionOnPost.isAuthor(user, _id);
+    return await ReactionOnPost.delete(_id);
+  }
+
+  @Router.delete("/threads/:_target/reactions:_id")
+  async deleteReactionOnThread(session: WebSessionDoc, _target: ObjectId, _id: ObjectId) {
+    const user = WebSession.getUser(session);
+    const thread = (await Thread.getThreads({ _id: _target }))[0];
+    await verifyPosterFriendship(user, thread.root);
+    await ReactionOnThread.isAuthor(user, _id);
+    return await ReactionOnThread.delete(_id);
   }
 
   @Router.get("/friends")
@@ -114,9 +299,10 @@ class Routes {
   }
 
   @Router.post("/friend/requests/:to")
-  async sendFriendRequest(session: WebSessionDoc, to: string) {
+  async sendFriendRequest(session: WebSessionDoc, to: string, phone: string) {
     const user = WebSession.getUser(session);
     const toId = (await User.getUserByUsername(to))._id;
+    await User.isValidLineNumber(toId, phone);
     return await Friend.sendRequest(user, toId);
   }
 
@@ -153,147 +339,171 @@ class Routes {
     return await Announcement.create(user, body);
   }
 
-  @Router.get("/comments")
-  async getComments(user?: string, target?: string) {
-    const query = {};
-
-    if (user) {
-      const id = (await User.getUserByUsername(user))._id;
-      Object.assign(query, { user: id });
-    }
-
-    if (target) {
-      Object.assign(query, { target });
-    }
-
-    return await Comment.getComments(query);
-  }
-
-  @Router.post("/comments")
-  async createComment(session: WebSessionDoc, target: ObjectId, body: string) {
+  @Router.patch("/profiles")
+  async updateProfile(session: WebSessionDoc, update: Partial<ProfileDoc>) {
     const user = WebSession.getUser(session);
-    return await Comment.create(user, target, body);
-    // run moderator before posting
+    return await Profile.update(user, update);
   }
 
-  @Router.patch("/comments/:_id")
-  async updateComment(session: WebSessionDoc, _id: ObjectId, update: Partial<CommentDoc>) {
-    const user = WebSession.getUser(session);
-    await Comment.isAuthor(user, _id);
-    return await Comment.update(_id, update);
-    // run moderator before posting
-  }
-
-  @Router.delete("/comments/:_id")
-  async deleteComment(session: WebSessionDoc, _id: ObjectId) {
-    const user = WebSession.getUser(session);
-    await Comment.isAuthor(user, _id);
-    return Comment.delete(_id);
-  }
-
-  @Router.get("/moderators/")
-  async getModerators(/*session: WebSessionDoc*/) {
-    /**
-     * const user = WebSession.getUser(session);
-       return await Moderator.getModeratorsByUser(user); */
-  }
-
-  @Router.post("/moderators/")
-  async createModerator(/*session: WebSessionDoc, text: string*/) {
-    /** 
-     * const user = WebSession.getUser(session);
-       return await Moderator.create(user, text);
-    */
-  }
-
-  @Router.get("/profiles/")
-  async getProfile(/*session: WebSessionDoc, name: string*/) {
-    /**
-     * const user = WebSession.getUser(session);
-     * get profileUser = user profile associated with name
-     * check that user is friends with the user profile they are trying to view or is the user profile
-     * if yes, await Profile.getProfileByUser(profileUser)
-     * otherwise throw error
-     */
-  }
-
-  @Router.patch("/profiles/")
-  async updateProfile(/*session: WebSessionDoc, update: Partial<ProfileDoc>*/) {
-    /**
-     * const user = WebSession.getUser(session);
-     * check that user owns the profile they are trying to update
-     * Profile.update(user, Partial<ProfileDoc>)
-     */
-  }
-
-  @Router.get("/reactions/")
-  async getReactions(/* session: WebSessionDoc, user?: string, target?: string*/) {
-    /**
-     * create new filter by user or by target
-     * search reactions
-     */
-  }
-
-  @Router.post("/reactions/")
-  async createReaction(/* session: WebSessionDoc, target: ObjectId, body: string*/) {
-    /**
-     * create new reaction with target and body, check that body is an emoji
-     */
-  }
-
-  @Router.patch("/reactions/:_id")
-  async updateReaction(/* session: WebSessionDoc, _id: ObjectId, update: Partial<ReactionDoc>*/) {
-    /**
-     * check that user is author of reaction
-     * allow them to update with the update object
-     */
-  }
-
-  @Router.delete("/reactions/:_id")
-  async deleteReaction(/* session: WebSessionDoc, _id: ObjectId */) {
-    /**
-     * check that user is author of reaction
-     * allow them to delete the reaction with id _id
-     */
+  @Router.get("/profiles")
+  async getProfile(session: WebSessionDoc, owner?: string) {
+    const id = owner ? (await User.getUserByUsername(owner))._id : WebSession.getUser(session);
+    return await Profile.getProfileByUser(id);
   }
 
   @Router.get("/recaps/")
-  async getRecaps(/* session: WebSessionDoc */) {
-    /**
-     * const user = WebSession.getUser(session);
-     * return await Recap.getRecapsByUser(user);
-     */
+  async getRecaps(session: WebSessionDoc) {
+    const user = WebSession.getUser(session);
+    return await Recap.getRecaps(user);
   }
 
   @Router.post("/recaps/")
-  async createRecap(/* session: WebSessionDoc */) {
-    /**
-     * const user = WebSession.getUser(session);
-     * interactions: User → one Number
-     * numContent, numComment, numReaction: one Number
-     * Iterate through friends in friendships, and initialize interactions[friend] to 0
-     * Iterate through content in Content.getContentByAuthor(user) where the date is in the past month, and
-     * increment interactions[friend] for each tagged friend, and increment numContent
-     * Iterate through comments in Comment.getCommentByAuthor(user) where the date is in the past month, and
-     * increment numComment, get the associated artifact's author, and increment interactions[author] by one
-     * Iterate through reactions in Reaction.getReactionByAuthor(user) where the date is in the past month, and
-     * increment numReaction, get the associated artifact's author, and increment interactions[author] by one
-     * mostInteractedWith = users in interactions with the highest 3 numbers
-     * leastInteractedWith = users in interactions with the lowest 3 numbers
-     */
+  async createRecap(session: WebSessionDoc) {
+    const user = WebSession.getUser(session);
+    const interactions: Map<string, number> = new Map();
+    let numPost = 0;
+    let numThread = 0;
+    let numReaction = 0;
+    const date = new Date();
+    date.setMonth(date.getMonth() - 1);
+
+    for (const friend of await Friend.getFriends(user)) {
+      interactions.set(friend.toString(), 0);
+    }
+
+    // Get tagged users in content
+    for (const content of await Post.posts.readMany({ author: user, dateCreated: { $gte: date } })) {
+      for (const tag of content.tagged) {
+        const interactionsSum = interactions.get(tag.toString());
+        interactions.set(tag.toString(), interactionsSum ? interactionsSum + 1 : 1);
+      }
+
+      numPost += 1;
+    }
+
+    // Get authors of thread targets
+    for (const thread of await Thread.threads.readMany({ user, dateCreated: { $gte: date } })) {
+      const targetAuthor = (await Thread.threads.readOne({ _id: thread.target }))?.user || (await Post.posts.readOne({ _id: thread.target }))?.author;
+      if (targetAuthor == null) continue;
+
+      const interactionsSum = interactions.get(targetAuthor.toString());
+      interactions.set(targetAuthor.toString(), interactionsSum ? interactionsSum + 1 : 1);
+
+      numThread += 1;
+    }
+
+    // Get authors of posts reacted to
+    for (const reaction of await ReactionOnPost.getReactions({ user, dateCreated: { $gte: date } })) {
+      const targetAuthor = (await Post.getPosts({ _id: reaction.target }))[0].author;
+      const interactionsSum = interactions.get(targetAuthor.toString());
+      interactions.set(targetAuthor.toString(), interactionsSum ? interactionsSum + 1 : 1);
+
+      numReaction += 1;
+    }
+
+    // Get authors of threads reacted to
+    for (const reaction of await ReactionOnThread.getReactions({ user, dateCreated: { $gte: date } })) {
+      const targetAuthor = (await Thread.getThreads({ _id: reaction.target }))[0].user;
+      const interactionsSum = interactions.get(targetAuthor.toString());
+      interactions.set(targetAuthor.toString(), interactionsSum ? interactionsSum + 1 : 1);
+
+      numReaction += 1;
+    }
+
+    // Order interactions by most interacted to least interacted with
+    const interactionsDescending = [...interactions.entries()]
+      .sort((x, y) => y[1] - x[1])
+      .map((x) => new ObjectId(x[0]))
+      .filter((x) => x.toString() != user.id.toString());
+    const numSlots = Math.min(3, interactionsDescending.length % 2 == 0 ? interactionsDescending.length / 2 : (interactionsDescending.length - 1) / 2);
+
+    return await Recap.create(user, numPost, numThread, numReaction, interactionsDescending.slice(0, numSlots), interactionsDescending.slice(-1 * numSlots));
   }
 
-  @Router.get("/scheduledmessages/")
-  async getScheduledMessages(/* session: WebSessionDoc */) {
-    // get all scheduled messages sent by user or where recipient is user and scheduledTime is before Date.now()
+  @Router.get("/scheduledmessages/received")
+  async getScheduledMessagesByRecipient(session: WebSessionDoc) {
+    const user = WebSession.getUser(session);
+    const date = Date.now();
+    return await ScheduledMessage.getScheduledMessagesByRecipient(user, date);
+  }
+
+  @Router.get("/scheduledmessages/sent")
+  async getScheduledMessagesBySender(session: WebSessionDoc) {
+    const user = WebSession.getUser(session);
+    return await ScheduledMessage.getScheduledMessagesBySender(user);
   }
 
   @Router.post("/scheduledmessages/")
-  async createScheduledMessage(/* session: WebSessionDoc, recipients: string[], scheduledTime: number, title: string, body: string;*/) {
-    // get all user ids from usernames in recipients, check that they are all friends
-    // check that scheduledTime is in the future
-    // create new scheduled message using recipients, scheduledTime, title, body
+  async createScheduledMessage(session: WebSessionDoc, recipients: string[], scheduledTime: string, title: string, content: Content[]) {
+    const user = WebSession.getUser(session);
+
+    const recipientIds = [];
+
+    for (const username of recipients) {
+      const usernameId = (await User.getUserByUsername(username))._id;
+      if (usernameId.toString() !== user.toString()) await Friend.verifyFriends(user, usernameId);
+      recipientIds.push((await User.getUserByUsername(username))._id);
+    }
+
+    await ScheduledMessage.isValidScheduledTime(Number(scheduledTime));
+    await ScheduledMessage.isValidContent(content);
+
+    return await ScheduledMessage.create(user, recipientIds, Number(scheduledTime), title, content);
   }
+
+  @Router.patch("/scheduledmessages/:_id")
+  async updateScheduledMessage(session: WebSessionDoc, _id: ObjectId, update: Partial<Omit<ScheduledMessageDoc, "recipients"> & { recipients: string[] }>) {
+    const user = WebSession.getUser(session);
+    await ScheduledMessage.isAuthor(user, _id);
+
+    // Don't allow updates if message has been sent
+    await ScheduledMessage.isMessageSent(_id);
+
+    const updateModified: Partial<ScheduledMessageDoc> = {};
+
+    if (update.content) {
+      await ScheduledMessage.isValidContent(update.content);
+      updateModified.content = update.content;
+    }
+
+    if (update.scheduledTime) {
+      await ScheduledMessage.isValidScheduledTime(Number(update.scheduledTime));
+      updateModified.scheduledTime = Number(update.scheduledTime);
+    }
+
+    const recipientIds = [];
+
+    if (update.recipients) {
+      for (const username of update.recipients) {
+        const usernameId = (await User.getUserByUsername(username))._id;
+        if (usernameId.toString() !== user.toString()) await Friend.verifyFriends(user, usernameId);
+        recipientIds.push((await User.getUserByUsername(username))._id);
+      }
+
+      updateModified.recipients = recipientIds;
+    }
+
+    if (update.title) updateModified.title = update.title;
+
+    return await ScheduledMessage.update(_id, updateModified);
+  }
+
+  @Router.delete("/scheduledmessages/:_id")
+  async deleteScheduledMessage(session: WebSessionDoc, _id: ObjectId) {
+    const user = WebSession.getUser(session);
+    await ScheduledMessage.isAuthor(user, _id);
+    return ScheduledMessage.delete(_id);
+  }
+}
+
+async function verifyPosterFriendship(user: ObjectId, id: ObjectId) {
+  // Can only react if the post was made by a friend
+  const post = (await Post.getPosts({ _id: id }))[0];
+  if (post.author.toString() !== user.toString()) await Friend.verifyFriends(post.author, user);
+}
+
+async function getRootId(id: ObjectId) {
+  return (await Thread.getThreads({ _id: id }))[0].root;
 }
 
 export default getExpressRouter(new Routes());

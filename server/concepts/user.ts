@@ -5,20 +5,23 @@ import { BadValuesError, NotAllowedError, NotFoundError } from "./errors";
 export interface UserDoc extends BaseDoc {
   username: string;
   password: string;
+  phone: string;
 }
 
 export default class UserConcept {
   public readonly users = new DocCollection<UserDoc>("users");
+  private readonly phoneLength = 10;
+  private readonly lineNumberLength = 4;
 
-  async create(username: string, password: string) {
-    await this.canCreate(username, password);
-    const _id = await this.users.createOne({ username, password });
+  async create(username: string, password: string, phone: string) {
+    await this.canCreate(username, password, phone);
+    const _id = await this.users.createOne({ username, password, phone });
     return { msg: "User created successfully!", user: await this.users.readOne({ _id }) };
   }
 
   private sanitizeUser(user: UserDoc) {
     // eslint-disable-next-line
-    const { password, ...rest } = user; // remove password
+    const { password, phone, ...rest } = user; // remove password and phone number
     return rest;
   }
 
@@ -61,10 +64,29 @@ export default class UserConcept {
     return { msg: "Successfully authenticated.", _id: user._id };
   }
 
+  async isValidLineNumber(_id: ObjectId, phone: string) {
+    const user = await this.users.readOne({ _id });
+
+    if (!user) {
+      throw new NotAllowedError(`User not found!`);
+    }
+
+    this.isValidPhone(phone, this.lineNumberLength);
+
+    if (user.phone.substring(user.phone.length - 4) !== phone) {
+      throw new NotAllowedError(`User not found!`);
+    }
+  }
+
   async update(_id: ObjectId, update: Partial<UserDoc>) {
     if (update.username !== undefined) {
       await this.isUsernameUnique(update.username);
     }
+
+    if (update.phone !== undefined) {
+      this.isValidPhone(update.phone, this.phoneLength);
+    }
+
     await this.users.updateOne({ _id }, update);
     return { msg: "User updated successfully!" };
   }
@@ -81,11 +103,18 @@ export default class UserConcept {
     }
   }
 
-  private async canCreate(username: string, password: string) {
+  private async canCreate(username: string, password: string, phone: string) {
     if (!username || !password) {
       throw new BadValuesError("Username and password must be non-empty!");
     }
+    this.isValidPhone(phone, this.phoneLength);
     await this.isUsernameUnique(username);
+  }
+
+  private isValidPhone(phone: string, length: number) {
+    if (phone.length !== length || !/^[0-9]*$/.test(phone)) {
+      throw new BadValuesError(`Phone must be a ${length}-digit number!`);
+    }
   }
 
   private async isUsernameUnique(username: string) {

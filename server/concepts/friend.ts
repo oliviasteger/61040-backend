@@ -73,6 +73,19 @@ export default class FriendConcept {
     void this.friends.createOne({ user1, user2 });
   }
 
+  async verifyFriends(user1: ObjectId, user2: ObjectId) {
+    const friendship = await this.friends.readOne({
+      $or: [
+        { user1: user1, user2: user2 },
+        { user1: user2, user2: user1 },
+      ],
+    });
+
+    if (friendship === null) {
+      throw new FriendNotFoundError(user1, user2);
+    }
+  }
+
   private async removePendingRequest(from: ObjectId, to: ObjectId) {
     const request = await this.requests.popOne({ from, to, status: "pending" });
     if (request === null) {
@@ -104,6 +117,20 @@ export default class FriendConcept {
     if (request !== null) {
       throw new FriendRequestAlreadyExistsError(u1, u2);
     }
+
+    const date = new Date();
+    date.setMonth(date.getMonth() - 12);
+
+    const rejectedRequest = await this.requests.readOne({
+      from: { $in: [u1, u2] },
+      to: { $in: [u1, u2] },
+      status: "rejected",
+      dateCreated: { $gte: date },
+    });
+
+    if (rejectedRequest !== null) {
+      throw new RequestedInLastYearError(u1, u2);
+    }
   }
 }
 
@@ -122,6 +149,15 @@ export class FriendRequestAlreadyExistsError extends NotAllowedError {
     public readonly to: ObjectId,
   ) {
     super("Friend request between {0} and {1} already exists!", from, to);
+  }
+}
+
+export class RequestedInLastYearError extends NotAllowedError {
+  constructor(
+    public readonly from: ObjectId,
+    public readonly to: ObjectId,
+  ) {
+    super("Friend request between {0} and {1} has already been rejected in the past year!", from, to);
   }
 }
 
